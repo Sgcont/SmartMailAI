@@ -6,15 +6,20 @@ from email.message import EmailMessage
 from pathlib import Path
 import tkinter as tk
 from tkinter import messagebox, ttk
-
-try:
-    from openai import OpenAI
-except ImportError:
-    OpenAI = None
+from urllib import error, request
 
 
 APP_TITLE = "SmartMail AI"
 HISTORY_FILE = Path(__file__).with_name("historico.json")
+
+OLLAMA_PROVIDER = "Ollama (Local grátis)"
+GEMINI_PROVIDER = "Gemini (API Key)"
+AI_PROVIDERS = (OLLAMA_PROVIDER, GEMINI_PROVIDER)
+
+DEFAULT_MODELS = {
+    OLLAMA_PROVIDER: "llama3.1:8b",
+    GEMINI_PROVIDER: "gemini-1.5-flash",
+}
 
 STYLE_GUIDE = {
     "Formal": "Tom formal, respeitoso e objetivo.",
@@ -67,6 +72,21 @@ def strip_markdown_code_fence(text: str) -> str:
     return cleaned
 
 
+def parse_json_from_model_text(raw: str) -> dict:
+    cleaned = strip_markdown_code_fence(raw)
+    try:
+        parsed = json.loads(cleaned)
+    except json.JSONDecodeError:
+        start = cleaned.find("{")
+        end = cleaned.rfind("}")
+        if start < 0 or end <= start:
+            raise ValueError("A resposta da IA não veio em JSON válido.") from None
+        parsed = json.loads(cleaned[start : end + 1])
+    if not isinstance(parsed, dict):
+        raise ValueError("A resposta da IA não veio em formato de objeto JSON.")
+    return parsed
+
+
 def generate_fallback_email(
     sender_name: str,
     recipient_email: str,
@@ -101,8 +121,8 @@ class SmartMailApp(tk.Tk):
     def __init__(self) -> None:
         super().__init__()
         self.title(APP_TITLE)
-        self.geometry("1000x760")
-        self.minsize(900, 680)
+        self.geometry("1080x790")
+        self.minsize(960, 700)
         self.configure(padx=14, pady=14)
 
         self.sender_name_var = tk.StringVar()
@@ -113,7 +133,12 @@ class SmartMailApp(tk.Tk):
         self.style_var = tk.StringVar(value="Profissional")
         self.smtp_server_var = tk.StringVar(value="smtp.gmail.com")
         self.smtp_port_var = tk.StringVar(value="587")
-        self.api_key_var = tk.StringVar(value=os.getenv("OPENAI_API_KEY", ""))
+        self.ai_provider_var = tk.StringVar(value=OLLAMA_PROVIDER)
+        self.ai_model_var = tk.StringVar(value=DEFAULT_MODELS[OLLAMA_PROVIDER])
+        self.ai_api_key_var = tk.StringVar(
+            value=os.getenv("GEMINI_API_KEY", "") or os.getenv("GOOGLE_API_KEY", "")
+        )
+        self.ollama_url_var = tk.StringVar(value="http://localhost:11434")
 
         self._build_ui()
 
@@ -139,12 +164,16 @@ class SmartMailApp(tk.Tk):
         self._add_labeled_entry(form, "Assunto (opcional)", self.subject_var, 4)
         self._add_labeled_entry(form, "SMTP Server", self.smtp_server_var, 5)
         self._add_labeled_entry(form, "SMTP Port", self.smtp_port_var, 6)
-        self._add_labeled_entry(form, "OpenAI API Key (opcional)", self.api_key_var, 7, show="*")
+        self._add_labeled_combobox(form, "IA Provider", self.ai_provider_var, list(AI_PROVIDERS), 7)
+        self._add_labeled_entry(form, "Modelo IA", self.ai_model_var, 8)
+        self._add_labeled_entry(form, "API Key (Gemini)", self.ai_api_key_var, 9, show="*")
+        self._add_labeled_entry(form, "Ollama URL", self.ollama_url_var, 10)
+        self.ai_provider_var.trace_add("write", self._on_provider_change)
 
         objective_frame = ttk.LabelFrame(top_frame, text="Objetivo do e-mail")
         objective_frame.pack(side="right", fill="both", expand=True)
 
-        self.objective_text = tk.Text(objective_frame, height=10, wrap="word")
+        self.objective_text = tk.Text(objective_frame, height=12, wrap="word")
         self.objective_text.pack(fill="both", expand=True, padx=8, pady=8)
 
         template_frame = ttk.LabelFrame(self, text="Templates rápidos")
@@ -199,6 +228,24 @@ class SmartMailApp(tk.Tk):
         parent.columnconfigure(1, weight=1)
         return entry
 
+    @staticmethod
+    def _add_labeled_combobox(
+        parent: ttk.LabelFrame,
+        label: str,
+        variable: tk.StringVar,
+        values: list[str],
+        row: int,
+    ) -> ttk.Combobox:
+        ttk.Label(parent, text=label).grid(row=row, column=0, sticky="w", padx=8, pady=(6, 2))
+        combo = ttk.Combobox(parent, textvariable=variable, values=values, state="readonly")
+        combo.grid(row=row, column=1, sticky="ew", padx=8, pady=(0, 6))
+        parent.columnconfigure(1, weight=1)
+        return combo
+
+    def _on_provider_change(self, *_args) -> None:
+        provider = self.ai_provider_var.get()
+        self.ai_model_var.set(DEFAULT_MODELS.get(provider, self.ai_model_var.get()))
+
     def _set_template(self, content: str) -> None:
         self.objective_text.delete("1.0", "end")
         self.objective_text.insert("1.0", content)
@@ -226,27 +273,97 @@ class SmartMailApp(tk.Tk):
             "O corpo deve vir pronto para envio, com saudação, conteúdo e fechamento."
         )
 
-    def _call_openai(self, system_prompt: str, user_prompt: str) -> str:
-        api_key = self.api_key_var.get().strip() or os.getenv("OPENAI_API_KEY", "").strip()
-        if not api_key:
-            raise ValueError(
-                "OpenAI API Key não configurada. Informe no campo da tela ou na variável OPENAI_API_KEY."
-            )
-        if OpenAI is None:
-            raise ValueError(
-                "Biblioteca openai não instalada. Rode: pip install -r requirements.txt"
-            )
+    @staticmethod
+    def _http_post_json(url: str, payload: dict, timeout_seconds: int = 45) -> dict:
+        body = json.dumps(payload).encode("utf-8")
+        req = request.Request(
+            url=url,
+            data=body,
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        try:
+            with request.urlopen(req, timeout=timeout_seconds) as response:
+                data = response.read().decode("utf-8")
+        except error.HTTPError as exc:
+            raw = exc.read().decode("utf-8", errors="replace")
+            raise ValueError(f"HTTP {exc.code}: {raw}") from None
+        except error.URLError as exc:
+            raise ValueError(f"Falha de conexão: {exc.reason}") from None
+        try:
+            parsed = json.loads(data)
+        except json.JSONDecodeError as exc:
+            raise ValueError(f"Resposta inválida da IA: {exc}") from None
+        if not isinstance(parsed, dict):
+            raise ValueError("Resposta da IA não veio em formato JSON de objeto.")
+        return parsed
 
-        client = OpenAI(api_key=api_key)
-        response = client.chat.completions.create(
-            model="gpt-4o-mini",
-            messages=[
+    def _call_ollama(self, system_prompt: str, user_prompt: str) -> str:
+        model = self.ai_model_var.get().strip() or DEFAULT_MODELS[OLLAMA_PROVIDER]
+        base_url = self.ollama_url_var.get().strip().rstrip("/")
+        if not base_url:
+            base_url = "http://localhost:11434"
+
+        payload = {
+            "model": model,
+            "messages": [
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": user_prompt},
             ],
-            temperature=0.6,
+            "stream": False,
+            "options": {"temperature": 0.6},
+        }
+        data = self._http_post_json(f"{base_url}/api/chat", payload)
+        if data.get("error"):
+            raise ValueError(f"Ollama retornou erro: {data['error']}")
+        message = data.get("message")
+        if not isinstance(message, dict):
+            raise ValueError("Resposta do Ollama sem campo 'message'.")
+        content = (message.get("content") or "").strip()
+        if not content:
+            raise ValueError("Resposta do Ollama vazia.")
+        return content
+
+    def _call_gemini(self, system_prompt: str, user_prompt: str) -> str:
+        api_key = (
+            self.ai_api_key_var.get().strip()
+            or os.getenv("GEMINI_API_KEY", "").strip()
+            or os.getenv("GOOGLE_API_KEY", "").strip()
         )
-        return response.choices[0].message.content or ""
+        if not api_key:
+            raise ValueError("API Key do Gemini não configurada.")
+
+        model = self.ai_model_var.get().strip() or DEFAULT_MODELS[GEMINI_PROVIDER]
+        prompt = f"SYSTEM:\n{system_prompt}\n\nUSER:\n{user_prompt}"
+        payload = {
+            "contents": [{"role": "user", "parts": [{"text": prompt}]}],
+            "generationConfig": {"temperature": 0.6},
+        }
+        data = self._http_post_json(
+            f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={api_key}",
+            payload,
+        )
+        candidates = data.get("candidates")
+        if not isinstance(candidates, list) or not candidates:
+            raise ValueError(f"Resposta do Gemini sem candidates: {data}")
+        first = candidates[0]
+        content = first.get("content") if isinstance(first, dict) else None
+        parts = content.get("parts") if isinstance(content, dict) else None
+        if not isinstance(parts, list) or not parts:
+            raise ValueError("Resposta do Gemini sem parts.")
+        text_parts = [p.get("text", "") for p in parts if isinstance(p, dict)]
+        result = "\n".join(part for part in text_parts if part).strip()
+        if not result:
+            raise ValueError("Resposta do Gemini vazia.")
+        return result
+
+    def _call_ai(self, system_prompt: str, user_prompt: str) -> str:
+        provider = self.ai_provider_var.get().strip()
+        if provider == OLLAMA_PROVIDER:
+            return self._call_ollama(system_prompt, user_prompt)
+        if provider == GEMINI_PROVIDER:
+            return self._call_gemini(system_prompt, user_prompt)
+        raise ValueError("Provider de IA não suportado.")
 
     def generate_email(self) -> None:
         sender_name = self.sender_name_var.get().strip()
@@ -268,14 +385,14 @@ class SmartMailApp(tk.Tk):
         error_message = ""
 
         try:
-            raw = self._call_openai(
+            raw = self._call_ai(
                 system_prompt=(
                     "Você é um assistente especialista em redação de e-mails profissionais."
                     " Siga exatamente o idioma do pedido (pt-BR por padrão)."
                 ),
                 user_prompt=self._build_generation_prompt(),
             )
-            parsed = json.loads(strip_markdown_code_fence(raw))
+            parsed = parse_json_from_model_text(raw)
             generated_subject = (parsed.get("subject") or "").strip()
             generated_body = (parsed.get("body") or "").strip()
         except Exception as exc:
@@ -321,11 +438,11 @@ class SmartMailApp(tk.Tk):
                 f"Assunto:\n{subject}\n\n"
                 f"Corpo:\n{body}"
             )
-            raw = self._call_openai(
+            raw = self._call_ai(
                 system_prompt="Você é um tradutor profissional de e-mails corporativos.",
                 user_prompt=prompt,
             )
-            parsed = json.loads(strip_markdown_code_fence(raw))
+            parsed = parse_json_from_model_text(raw)
             translated_subject = (parsed.get("subject") or "").strip()
             translated_body = (parsed.get("body") or "").strip()
             if not translated_subject or not translated_body:
@@ -410,6 +527,8 @@ class SmartMailApp(tk.Tk):
                 "body": body,
                 "smtp_server": smtp_server,
                 "smtp_port": smtp_port,
+                "ai_provider": self.ai_provider_var.get().strip(),
+                "ai_model": self.ai_model_var.get().strip(),
             }
         )
         messagebox.showinfo(APP_TITLE, "E-mail enviado com sucesso.")
@@ -433,7 +552,8 @@ class SmartMailApp(tk.Tk):
         details = tk.Text(window, height=8, wrap="word")
         details.pack(fill="both", expand=False, padx=8, pady=(0, 8))
 
-        for idx, item in enumerate(reversed(history)):
+        reversed_history = list(reversed(history))
+        for idx, item in enumerate(reversed_history):
             tree.insert(
                 "",
                 "end",
@@ -450,12 +570,14 @@ class SmartMailApp(tk.Tk):
             if not selected:
                 return
             selected_idx = int(selected[0])
-            real_item = list(reversed(history))[selected_idx]
+            real_item = reversed_history[selected_idx]
             details.delete("1.0", "end")
             details.insert(
                 "1.0",
                 f"Objetivo: {real_item.get('objective', '')}\n"
                 f"Estilo: {real_item.get('style', '')}\n"
+                f"Provider IA: {real_item.get('ai_provider', '')}\n"
+                f"Modelo IA: {real_item.get('ai_model', '')}\n"
                 f"Mensagem:\n{real_item.get('body', '')}",
             )
 

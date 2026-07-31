@@ -24,9 +24,21 @@ Gere, personalize e envie e-mails profissionais usando Inteligência Artificial.
 pip install -r requirements.txt
 ```
 
-Para usar geração/tradução por IA com OpenAI:
+## Opções de IA (sem pagar por OpenAI)
 
-- Defina `OPENAI_API_KEY` no ambiente **ou** preencha no campo da interface.
+O app agora permite escolher o provider de IA na interface:
+
+1. **Ollama (Local grátis)** *(recomendado para uso sem custo por request)*  
+   - Instale: https://ollama.com/download  
+   - Baixe um modelo (exemplo):
+     ```bash
+     ollama pull llama3.1:8b
+     ```
+   - Deixe o Ollama rodando em `http://localhost:11434`.
+
+2. **Gemini (API Key)**  
+   - Gere uma chave no Google AI Studio.
+   - Preencha no campo `API Key (Gemini)` ou use `GEMINI_API_KEY` / `GOOGLE_API_KEY`.
 
 ## Executar
 
