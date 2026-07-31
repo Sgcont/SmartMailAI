@@ -1,1 +1,2 @@
-openai>=1.40.0
+# Sem dependências externas obrigatórias.
+# O app usa apenas bibliotecas padrão do Python.
